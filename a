@@ -1,0 +1,111 @@
+import requests
+import pandas as pd
+import json
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import lit, current_timestamp
+from pyspark.sql.types import IntegerType
+
+# -------------------------------
+# 1. Fetch SharePoint List Items
+# -------------------------------
+def get_sharepoint_list_data(client_id, client_secret, tenant_id, site_url, list_name):
+    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    token_data = {
+        'grant_type': 'client_credentials',
+        'client_id': client_id,
+        'client_secret': client_secret,
+        'scope': 'https://graph.microsoft.com/.default'
+    }
+    token_response = requests.post(token_url, data=token_data)
+    token_response.raise_for_status()
+    access_token = token_response.json().get('access_token')
+
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Accept': 'application/json',
+        'Content-Type': 'application/json'
+    }
+
+    site_info_url = f"https://graph.microsoft.com/v1.0/sites/root:/{site_url}"
+    site_response = requests.get(site_info_url, headers=headers)
+    site_response.raise_for_status()
+    site_data = site_response.json()
+
+    if 'id' not in site_data:
+        raise ValueError("Site ID not found in the response")
+    site_id = site_data['id']
+
+    list_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists?$filter=displayName eq '{list_name}'"
+    list_response = requests.get(list_url, headers=headers)
+    list_response.raise_for_status()
+    list_data = list_response.json()
+
+    if 'value' not in list_data or len(list_data['value']) == 0:
+        raise ValueError(f"List '{list_name}' not found")
+
+    list_id = list_data['value'][0]['id']
+    all_items = []
+
+    items_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items?$expand=fields"
+    while items_url:
+        response = requests.get(items_url, headers=headers)
+        response.raise_for_status()
+        items_data = response.json()
+        all_items.extend(items_data.get("value", []))
+        items_url = items_data.get("@odata.nextLink")
+
+    return all_items
+
+# -------------------------------
+# 2. Flatten Items to DataFrame
+# -------------------------------
+def process_sharepoint_data(response_data):
+    processed_items = []
+
+    for item in response_data:
+        all_fields = item.copy()
+        fields = item.get('fields', {})
+
+        for key, value in fields.items():
+            if isinstance(value, dict):
+                for subkey, subvalue in value.items():
+                    all_fields[f"{key}_{subkey}"] = subvalue
+            else:
+                all_fields[key] = value
+
+        processed_items.append(all_fields)
+
+    df = pd.DataFrame(processed_items)
+
+    # Ensure JSON-serializable
+    for col_name in df.columns:
+        df[col_name] = df[col_name].apply(lambda x: json.dumps(x) if isinstance(x, dict) else x)
+
+    return df
+
+# -------------------------------
+# 3. Entry Point
+# -------------------------------
+if __name__ == "__main__":
+    # 🔐 Replace with your actual values
+   
+    tenant_id = "57fdf63b-7e22-45a3-83dc-d37003163aae"
+    sharepoint_url = "https://mytakeda.sharepoint.com/sites/BioLifeQualityOperations"
+    list_name = "QLT Hours Upload"
+
+    # 1. Get SharePoint data
+    site_path = '/'.join(sharepoint_url.split('/')[3:])
+    raw_data = get_sharepoint_list_data(client_id, client_secret, tenant_id, site_path, list_name)
+    pandas_df = process_sharepoint_data(raw_data)
+
+    # 2. Convert to Spark DataFrame
+    spark = SparkSession.builder.getOrCreate()
+    spark_df = spark.createDataFrame(pandas_df)
+
+    # 3. Add required columns
+    spark_df = spark_df.withColumn("op", lit("U"))  # upsert operation
+    spark_df = spark_df.withColumn("insrt_dtm", current_timestamp())
+    spark_df = spark_df.withColumn("sequence_number", lit(None).cast(IntegerType()))  # always null
+
+   
+  
